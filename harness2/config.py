@@ -25,7 +25,8 @@ ROOT = PKG.parent if (PKG.parent / "pyproject.toml").is_file() else Path.cwd()
 THIRD_PARTY = ROOT / "third_party"
 METHOD_VERSION = 2
 
-DEPENDENCIES = ROOT / "dependencies"
+# Benchmark checkouts live here; a deployment may relocate them (e.g. into a container image).
+DEPENDENCIES = Path(os.environ.get("HARNESS2_DEPENDENCIES_DIR") or ROOT / "dependencies").expanduser()
 
 
 class ConfigError(RuntimeError):
@@ -98,6 +99,7 @@ os.environ.setdefault("GOOGLE_CLOUD_LOCATION", VERTEX_REGION)
 
 SOLVER_MODEL_OC = env("HARNESS2_SOLVER_MODEL", "")
 SOLVER_MODEL_CX = env("HARNESS2_CODEX_MODEL", SOLVER_MODEL_OC.split("/", 1)[-1])
+SOLVER_MODEL_CC = env("HARNESS2_CLAUDE_SOLVER_MODEL", "")
 IMPROVER_MODEL = env("HARNESS2_IMPROVER_MODEL", SOLVER_MODEL_OC)
 JUDGE_MODEL = env("HARNESS2_JUDGE_MODEL", "")
 
@@ -170,6 +172,11 @@ WB_CX_HARNESS_VER = CODEX_VERSION
 WB_MAX_JOBS = {"oc": 1, "cx": 1}
 WB_MAX_TRIALS = {"oc": 2, "cx": 2}
 WB_MODEL_CONNECTION = "local_proxy"
+
+# Explicit gateway mode for the claude_cli channel: when set, improver sessions reach the model
+# through this Anthropic-compatible endpoint (e.g. a LiteLLM proxy) instead of Vertex.
+CLAUDE_GATEWAY_URL = env("HARNESS2_CLAUDE_GATEWAY_URL", "")
+CLAUDE_GATEWAY_TOKEN = env("HARNESS2_CLAUDE_GATEWAY_TOKEN", "")
 
 DEFAULT_PROPOSER_CHANNEL = "opencode"
 PROPOSER_MODEL_BY_CHANNEL = {"opencode": IMPROVER_MODEL, "claude_cli": IMPROVER_MODEL}

@@ -129,6 +129,7 @@ def overlays(name: str, *, dry_run=False):
     if name == "harvey-labs":
         pairs = [
             (assets / "lab_runner" / "opencode", repo / "opencode"),
+            (assets / "lab_runner" / "claude_code", repo / "claude_code"),
             (assets / "lab_runner" / "tts_lab", repo / "external" / "tts_lab"),
             (assets / "lab_runner" / "adapt_runs_cx", repo / "external" / "adapt_runs_cx"),
         ]

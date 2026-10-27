@@ -104,7 +104,24 @@ class Proposer:
 
     def env(self) -> dict[str, str]:
         e = {k: v for k, v in os.environ.items() if k not in _DROP_ENV}
-        if self.spec.kind == "claude_cli":
+        if self.spec.kind == "claude_cli" and config.CLAUDE_GATEWAY_URL:
+            if not config.CLAUDE_GATEWAY_TOKEN:
+                raise ValueError("HARNESS2_CLAUDE_GATEWAY_URL is set but HARNESS2_CLAUDE_GATEWAY_TOKEN is not")
+            m = self.spec.model
+            e.update(
+                {
+                    "ANTHROPIC_BASE_URL": config.CLAUDE_GATEWAY_URL,
+                    "ANTHROPIC_AUTH_TOKEN": config.CLAUDE_GATEWAY_TOKEN,
+                    "ANTHROPIC_MODEL": m,
+                    # background and subagent calls go to the same model, never a default one
+                    "ANTHROPIC_SMALL_FAST_MODEL": m,
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": m,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": m,
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": m,
+                    "CLAUDE_CODE_SUBAGENT_MODEL": m,
+                }
+            )
+        elif self.spec.kind == "claude_cli":
             e.update(
                 {
                     "CLAUDE_CODE_USE_VERTEX": "1",

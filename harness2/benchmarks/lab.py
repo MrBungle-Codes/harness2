@@ -30,12 +30,14 @@ import threading
 from dataclasses import replace
 from functools import cache
 from pathlib import Path
+from typing import Callable
 
 from .. import config
 from ..core import runmark as RM
 from ..core import tree as HT
 from ..core.spec import BenchPrompts, BenchSpec, resolve_channel_model
 from ..substrate.base import Install, RunRequest
+from ..substrate.claude_code import CLAUDE_CODE_SURFACE, ClaudeCodeSubstrate
 from ..substrate.codex import CODEX_SURFACE, CodexSubstrate
 from ..substrate.opencode import OPENCODE_SURFACE, OpencodeSubstrate
 from .tasks import discover, select
@@ -326,6 +328,7 @@ directly with shell tools such as `cat`.
 _EXTRACT_SRC = r"""
 import json, sys
 from pathlib import Path
+from typing import Callable
 
 # Imported at driver top, not inside extract(): a reader that cannot be imported at all
 # must exit non-zero here so deliverable_files raises, rather than degrading per file.
@@ -374,6 +377,7 @@ sys.stdout.write(body)
 _RENDER_CHECK_SRC = r"""
 import json, sys, tempfile
 from pathlib import Path
+from typing import Callable
 try:
     from opencode.render import render_tree
     with tempfile.TemporaryDirectory() as td:
@@ -429,6 +433,42 @@ def _require_runner(path: Path) -> None:
         )
 
 
+_CC_BASE_BODY_SRC = r"""
+import sys
+from claude_code.run_claude_code import compose_prompt
+sys.stdout.write(compose_prompt(sys.argv[1]))
+"""
+
+# LAB's own skills are installed into every Claude Code workspace by the runner; a harness may
+# not define skills under these names (they would shadow the base manuals).
+_LAB_BASE_SKILLS = ("docx", "pptx", "xlsx")
+
+# What a Claude Code launcher is handed: (task_id, run_id, materialised install dir, results
+# root, timeout). A deployment injects one to run the rollout elsewhere (e.g. as a K8s Job with
+# the task's criteria kept out of the agent's container); None runs the runner locally.
+CcLauncher = Callable[[str, str, Path, Path, int], None]
+
+
+@cache
+def _claude_base_body(skill_mode: str) -> str:
+    """The LAB base body for Claude Code, composed in the LAB environment (reads SKILL.md)."""
+    _require_runner(config.lab_repo() / "claude_code" / "run_claude_code.py")
+    r = subprocess.run(
+        [str(config.LAB_PYTHON), "-c", _CC_BASE_BODY_SRC, skill_mode],
+        cwd=config.lab_repo(),
+        env=_lab_env(),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError(
+            f"Claude Code base-body compose failed under {config.LAB_PYTHON} "
+            f"(rc={r.returncode}): {r.stderr.strip()[-800:]}"
+        )
+    return r.stdout
+
+
 @cache
 def _opencode_base_body(skill_mode: str) -> str:
     """Composed once per process per mode: composing reads every SKILL.md."""
@@ -477,19 +517,25 @@ def _require_runtime_scripts() -> frozenset[str]:
 
 def lab_spec(substrate_name: str) -> BenchSpec:
     """The LAB BenchSpec for one substrate cell. A value, not a code path."""
-    if substrate_name not in ("oc", "cx"):
-        raise ValueError(f"substrate must be 'oc' or 'cx', got {substrate_name!r}")
+    if substrate_name not in ("oc", "cx", "cc"):
+        raise ValueError(f"substrate must be 'oc', 'cx' or 'cc', got {substrate_name!r}")
     channel = resolve_channel_model(None, None, effort="high")
     return BenchSpec(
         name="lab",
         runs_root=config.RUNS / "lab",
-        install_mode="workspace_config" if substrate_name == "oc" else "codex_root",
+        install_mode={"oc": "workspace_config", "cx": "codex_root", "cc": "claude_workspace"}[
+            substrate_name
+        ],
         prompts=LAB_BASE,
         channels={"proposer": channel, "selector": channel},
         domain_word="practice area",
         leak_globs=("task.json",),
         allow_subagents=False,
-        reserved_scripts=_runtime_scripts() if substrate_name == "oc" else frozenset(),
+        reserved_scripts=(
+            _runtime_scripts()
+            if substrate_name == "oc"
+            else frozenset({"read_doc.py"}) if substrate_name == "cc" else frozenset()
+        ),
         proposer_deliverables="contents",
         obs_trunc=50_000,
     )
@@ -513,15 +559,21 @@ class LabAdapter:
         solver_effort: str = "high",
         judge_model: str = JUDGE_MODEL,
         split_file: Path | None = None,
+        cc_launcher: CcLauncher | None = None,
     ):
         self.split_file = split_file
         if skill_mode not in ("native", "inline"):
             raise ValueError(f"skill_mode must be 'native' or 'inline', got {skill_mode!r}")
         self.spec = lab_spec(substrate)
+        self._cc_launcher = cc_launcher
         if substrate == "oc":
             self.substrate = OpencodeSubstrate(launcher=self._launch_oc)
             self.model = model or config.SOLVER_MODEL_OC
             self._results_root = config.RUNS / "lab" / "results" / "oc"
+        elif substrate == "cc":
+            self.substrate = ClaudeCodeSubstrate(launcher=self._launch_cc)
+            self.model = model or config.SOLVER_MODEL_CC
+            self._results_root = config.RUNS / "lab" / "results" / "cc"
         else:
             self.substrate = CodexSubstrate(launcher=self._launch_cx)
             self.model = model or config.SOLVER_MODEL_CX
@@ -684,6 +736,50 @@ class LabAdapter:
             dirs.append(self._run_dir(run_id))
         return dirs
 
+    def _launch_cc(self, req: RunRequest, install: Install) -> list[Path]:
+        """Claude Code rollouts. The base harness is a canonical tree, so it is materialised
+        here too: the runner always receives a Claude Code install, never a raw tree."""
+        staged = None
+        inst_dir = install.staging_dir
+        if install.extras.get("harness") == "base":
+            staged = self.substrate.materialise(install.staging_dir, self.spec, {})
+            inst_dir = staged.staging_dir
+        dirs = []
+        try:
+            for run_id in req.run_ids:
+                if self._cc_launcher is not None:
+                    self._cc_launcher(req.task_ref, run_id, Path(inst_dir), self._results_root, req.timeout)
+                else:
+                    runner = config.lab_repo() / "claude_code" / "run_claude_code.py"
+                    _require_runner(runner)
+                    cmd = [
+                        str(config.LAB_PYTHON), "-u", "-m", "claude_code.run_claude_code", "all",
+                        "--task", req.task_ref,
+                        "--run-id", run_id,
+                        "--results-root", str(self._results_root),
+                        "--model", self.model,
+                        "--skill-mode", self.skill_mode,
+                        "--timeout", str(req.timeout),
+                        "--harness-install", str(inst_dir),
+                    ]
+                    try:
+                        run_detached(
+                            cmd,
+                            cwd=config.lab_repo(),
+                            env=_lab_env(),
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=req.timeout * 2 + 600,
+                        )
+                    except subprocess.TimeoutExpired:
+                        print(f"  [lab-cc] runner wall-timeout for {req.task_ref} @ {run_id}", flush=True)
+                dirs.append(self._run_dir(run_id))
+        finally:
+            if staged is not None:
+                shutil.rmtree(staged.staging_dir, ignore_errors=True)
+        return dirs
+
     def _launch_cx(self, req: RunRequest, install: Install) -> list[Path]:
         runner = config.lab_repo() / "external" / "adapt_runs_cx" / "run_codex_lab.py"
         _require_runner(runner)
@@ -759,7 +855,8 @@ class LabAdapter:
 
     def trajectory(self, run_dir: Path, *, obs_trunc: int) -> str:
         """The substrate's ONE renderer over the raw session stream, effectively uncapped."""
-        name = "opencode_session.jsonl" if self.substrate.name == "oc" else "codex_session.jsonl"
+        name = {"oc": "opencode_session.jsonl", "cx": "codex_session.jsonl",
+                "cc": "claude_session.jsonl"}[self.substrate.name]
         stream = Path(run_dir) / name
         if not stream.is_file():
             return f"(no trajectory recorded for {Path(run_dir).name})"
@@ -822,6 +919,8 @@ class LabAdapter:
         pid: the domain threads of one sweep share the path."""
         if self.substrate.name == "oc":
             d = self.spec.runs_root / f"_base_harness_{self.skill_mode}_{os.getpid()}"
+        elif self.substrate.name == "cc":
+            d = self.spec.runs_root / f"_base_harness_cc_{self.skill_mode}_{os.getpid()}"
         else:
             d = self.spec.runs_root / f"_base_harness_cx_{os.getpid()}"
         with _BASE_LOCK:
@@ -831,6 +930,17 @@ class LabAdapter:
                         OPENCODE_SURFACE,
                         {
                             "systemprompt.md": _opencode_base_body(self.skill_mode),
+                            "guardrails.md": "",
+                            "LongTermMEMORY.md": "",
+                            "tool_descriptions/tool_guidance.md": "",
+                        },
+                        d,
+                    )
+                elif self.substrate.name == "cc":
+                    HT.write_tree(
+                        CLAUDE_CODE_SURFACE,
+                        {
+                            "systemprompt.md": _claude_base_body(self.skill_mode),
                             "guardrails.md": "",
                             "LongTermMEMORY.md": "",
                             "tool_descriptions/tool_guidance.md": "",
@@ -847,8 +957,35 @@ class LabAdapter:
         via scripts/read_doc.py. oc checks the RENDERED prompt, cx the AGENTS.md body."""
         if self.substrate.name == "oc":
             self._validate_oc(tree)
+        elif self.substrate.name == "cc":
+            self._validate_cc(tree)
         else:
             self._validate_cx(tree)
+
+    def _validate_cc(self, tree: dict[str, str]) -> None:
+        """cc checks the always-on text (what CLAUDE.md imports) and the reserved skill names."""
+        body = HT.always_on_text(CLAUDE_CODE_SURFACE, tree)
+        errs = []
+        if "output/" not in body:
+            errs.append(
+                "the always-on text must say deliverables go to `output/<filename>` "
+                "explicitly -- anything left outside output/ is invisible to grading. Add the "
+                "output/ rule back to systemprompt.md."
+            )
+        if "read_doc.py" not in body:
+            errs.append(
+                "the always-on text must say .docx/.pdf/.pptx/.xlsx are readable only via "
+                "`python3 scripts/read_doc.py <path> --in host` -- the Read tool returns noise "
+                "for binary documents. Add the read_doc.py rule back to systemprompt.md."
+            )
+        clash = sorted(set(HT.skill_names(CLAUDE_CODE_SURFACE, tree)) & set(_LAB_BASE_SKILLS))
+        if clash:
+            errs.append(
+                f"skills {clash} would shadow LAB's base manuals of the same name, which the "
+                f"runner installs in every workspace; rename them"
+            )
+        if errs:
+            raise ValueError(" | ".join(errs))
 
     def _validate_oc(self, tree: dict[str, str]) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -930,7 +1067,8 @@ class LabAdapter:
 
     def preflight(self) -> None:
         """Everything money-adjacent, checked before a rollout is paid for."""
-        self.substrate.preflight()
+        if not (self.substrate.name == "cc" and self._cc_launcher is not None):
+            self.substrate.preflight()  # an injected cc launcher runs claude elsewhere
         if not config.LAB_PYTHON.is_file():
             raise RuntimeError(
                 f"LAB interpreter missing at {config.LAB_PYTHON}; run python scripts/setup_benchmark.py lab"
@@ -938,6 +1076,8 @@ class LabAdapter:
         if self.substrate.name == "oc":
             _require_runner(config.lab_repo() / "opencode" / "run_opencode.py")
             _require_runtime_scripts()
+        elif self.substrate.name == "cc":
+            _require_runner(config.lab_repo() / "claude_code" / "run_claude_code.py")
         else:
             _require_runner(config.lab_repo() / "external" / "adapt_runs_cx" / "run_codex_lab.py")
         try:
